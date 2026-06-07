@@ -8,13 +8,14 @@
 
 void app_main(void)
 {
-  display_init();
+  xTaskCreatePinnedToCore(
+    task_display_draw,
+    "task_display",
+    2000,
+    NULL,
+    1,
+    NULL,
+    1
+  );
 
-  display_show_menu();
-
-  display_update();
-
-  while(1){
-    vTaskDelay(1000 / portTICK_PERIOD_MS);
-  }
 }
