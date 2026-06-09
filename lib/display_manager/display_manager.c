@@ -54,7 +54,7 @@ void task_display_draw(void *pvParameters)
         display_status_update(cont);
 
         display_show_menu();
-        printf("display update, status %s\n", system_status);
+        printf("[Monitor] display update, status %s\n", system_status);
 
         cont++;
         if (cont > 4)
