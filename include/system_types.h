@@ -3,6 +3,7 @@
 
 typedef struct {
     const char *text;
+    int id;
 } system_message;
 
 #endif

@@ -13,7 +13,7 @@ static volatile uint64_t last_isr_time[4] = {0, 0, 0, 0};
 // static volatile uint64_t last_isr_time = 0;
 static volatile uint32_t counter = 0;
 
-static QueueHandle_t button_queue;
+extern QueueHandle_t button_queue;
 
 static void IRAM_ATTR button_isr_handler(void *arg)
 {
@@ -33,15 +33,19 @@ static void IRAM_ATTR button_isr_handler(void *arg)
         {
         case 0:
             msg.text = "UP";
+            msg.id = 0;
             break;
-        case 1:
+            case 1:
             msg.text = "DOWN";
+            msg.id = 1;
             break;
-        case 2:
+            case 2:
             msg.text = "ENTER";
+            msg.id = 2;
             break;
-        default:
+            default:
             msg.text = "UNKNOWN";
+            msg.id = -1;
             break;
         }
 
@@ -57,7 +61,6 @@ static void IRAM_ATTR button_isr_handler(void *arg)
 
 void input_button_init(void)
 {
-    button_queue = xQueueCreate(10, sizeof(system_message));
 
     uint64_t pin_bit_mask = (1ULL << PIN_BTN_UP) |
                             (1ULL << PIN_BTN_DOWN) |
