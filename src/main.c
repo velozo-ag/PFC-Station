@@ -6,26 +6,28 @@
 #include "display_manager.h"
 #include "input_manager.h"
 #include "system_types.h"
+#include "radio_manager.h"
 
 QueueHandle_t button_queue;
 
 void app_main(void)
 {
-
   button_queue = xQueueCreate(10, sizeof(system_message));
   if(button_queue == NULL){
     printf("[Error] No se pudo crear la queue.\n");
     return;
   }
-  // xTaskCreatePinnedToCore(
-  //   task_input_button,
-  //   "task_input",
-  //   2048,
-  //   NULL,
-  //   2,
-  //   NULL,
-  //   1
-  // );
+
+  radio_manager_init();
+
+  xTaskCreatePinnedToCore(
+      task_radio_manager,
+      "task_radio",
+      4096,
+      NULL,
+      2,
+      NULL,
+      0);
 
   xTaskCreatePinnedToCore(
       task_display_draw,
