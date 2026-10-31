@@ -8,14 +8,19 @@
 #include "esp_mac.h"
 #include "esp_netif.h"
 #include "esp_now.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "nvs_flash.h"
 #include "sdp_protocol.h"
 
 static QueueHandle_t s_radio_rx_queue = NULL;
+static discovered_node_t s_discovered_nodes[RADIO_MAX_DISCOVERED_NODES];
+static size_t s_discovered_count = 0;
+static SemaphoreHandle_t s_discovered_mutex = NULL;
 
 static void radio_recv_cb(const esp_now_recv_info_t* esp_now_info,
                           const uint8_t* data, int data_len) {
@@ -47,6 +52,13 @@ static void radio_send_cb(const esp_now_send_info_t* tx_info,
                           esp_now_send_status_t status) {}
 
 esp_err_t radio_manager_init(void) {
+    if (s_discovered_mutex == NULL) {
+        s_discovered_mutex = xSemaphoreCreateMutex();
+        if (s_discovered_mutex == NULL) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
     s_radio_rx_queue = xQueueCreate(10, sizeof(radio_rx_packet_t));
     if (s_radio_rx_queue == NULL) {
         return ESP_ERR_NO_MEM;
@@ -172,15 +184,101 @@ esp_err_t radio_manager_send_radar_ping(void) {
     return radio_manager_send_broadcast((const uint8_t*)&packet, total_len);
 }
 
+// imprime en serial una tabla con todos los nodos que almacena en ram
+void radio_manager_print_nodes_table(void) {
+    if (s_discovered_mutex == NULL) {
+        return;
+    }
+
+    if (xSemaphoreTake(s_discovered_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        printf("\n=================== NODOS EN RAM (%zu) ===================\n",
+               s_discovered_count);
+        if (s_discovered_count == 0) {
+            printf("  (Ningun nodo descubierto aun)\n");
+        } else {
+            for (size_t i = 0; i < s_discovered_count; i++) {
+                printf(
+                    "#%02zu | MAC: %02X:%02X:%02X:%02X:%02X:%02X | Name: %-14s "
+                    "| Tipo: %u | Serv: %u | RSSI: %3d dBm\n",
+                    i + 1, s_discovered_nodes[i].mac[0],
+                    s_discovered_nodes[i].mac[1], s_discovered_nodes[i].mac[2],
+                    s_discovered_nodes[i].mac[3], s_discovered_nodes[i].mac[4],
+                    s_discovered_nodes[i].mac[5],
+                    s_discovered_nodes[i].node_name,
+                    s_discovered_nodes[i].node_type,
+                    s_discovered_nodes[i].services_count,
+                    s_discovered_nodes[i].rssi);
+            }
+        }
+        printf(
+            "==============================================================="
+            "\n\n");
+        xSemaphoreGive(s_discovered_mutex);
+    }
+}
+
+size_t radio_manager_get_discovered_count(void) {
+    size_t count = 0;
+    if (s_discovered_mutex != NULL &&
+        xSemaphoreTake(s_discovered_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        count = s_discovered_count;
+        xSemaphoreGive(s_discovered_mutex);
+    }
+    return count;
+}
+
+/*
+copia los nodos descubiertos, los copia en una variable y los
+retorna, liberando rapidamente el mutex
+*/
+size_t radio_manager_get_discovered_nodes(discovered_node_t* out_nodes,
+                                          size_t max_count) {
+    if (out_nodes == NULL || max_count == 0) {
+        return 0;
+    }
+
+    size_t copied = 0;
+    if (s_discovered_mutex != NULL &&
+        xSemaphoreTake(s_discovered_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        copied =
+            s_discovered_count < max_count ? s_discovered_count : max_count;
+        memcpy(out_nodes, s_discovered_nodes,
+               copied * sizeof(discovered_node_t));
+        xSemaphoreGive(s_discovered_mutex);
+    }
+    return copied;
+}
+
+void radio_manager_clear_discovered_nodes(void) {
+    if (s_discovered_mutex != NULL &&
+        xSemaphoreTake(s_discovered_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        s_discovered_count = 0;
+        memset(s_discovered_nodes, 0, sizeof(s_discovered_nodes));
+        xSemaphoreGive(s_discovered_mutex);
+        printf("[SDP] RAM Nodes clear.\n");
+    }
+}
+
 void task_radio_manager(void* pvParameters) {
     radio_rx_packet_t rx_pkt;
+    int64_t last_radar_ping_us = 0;
 
     while (1) {
-        if (xQueueReceive(s_radio_rx_queue, &rx_pkt, portMAX_DELAY)) {
+        // Ping Automatico cada 3s para pruebas
+        int64_t now_us = esp_timer_get_time();
+        if ((now_us - last_radar_ping_us) >= 3000000LL) {
+            radio_manager_send_radar_ping();
+            printf("[SDP Radar] Ping broadcast transmitido...\n");
+            last_radar_ping_us = now_us;
+        }
+        // -----------------------------------------------
+
+        if (xQueueReceive(s_radio_rx_queue, &rx_pkt, pdMS_TO_TICKS(100))) {
+            // valida que al menos tenga tamano del header, y si tiene el magic
+            // correcto
             if (rx_pkt.len < sizeof(sdp_header_t)) {
                 continue;
             }
-
             sdp_header_t* hdr = (sdp_header_t*)rx_pkt.payload;
             if (hdr->magic != SDP_MAGIC) {
                 continue;
@@ -192,16 +290,83 @@ void task_radio_manager(void* pvParameters) {
                 hdr->msg_type, rx_pkt.mac[0], rx_pkt.mac[1], rx_pkt.mac[2],
                 rx_pkt.mac[3], rx_pkt.mac[4], rx_pkt.mac[5], rx_pkt.rssi);
 
+            // para los PROBE msg's
             if (hdr->msg_type == SDP_MSG_PROBE_RESP) {
                 if (hdr->payload_len >= sizeof(sdp_probe_resp_payload_t)) {
+
                     sdp_probe_resp_payload_t* probe =
                         (sdp_probe_resp_payload_t*)(rx_pkt.payload +
                                                     sizeof(sdp_header_t));
-                    printf(
-                        "[Radio Core0] Discovered Node: %s (Type=%d, "
-                        "Paired=%d, Services=%d)\n",
-                        probe->node_name, probe->node_type, probe->is_paired,
-                        probe->services_count);
+                    uint32_t now_ms =
+                        (uint32_t)(esp_timer_get_time() / 1000ULL);
+
+                    if (s_discovered_mutex != NULL &&
+                        xSemaphoreTake(s_discovered_mutex,
+                                       pdMS_TO_TICKS(100)) == pdTRUE) {
+                        int found_idx = -1;
+                        for (size_t i = 0; i < s_discovered_count; i++) {
+                            if (memcmp(s_discovered_nodes[i].mac, rx_pkt.mac,
+                                       6) == 0) {
+                                found_idx = (int)i;
+                                break;
+                            }
+                        }
+
+                        if (found_idx >= 0) {
+                            s_discovered_nodes[found_idx].rssi = rx_pkt.rssi;
+                            s_discovered_nodes[found_idx].last_seen_ms = now_ms;
+                            s_discovered_nodes[found_idx].is_paired =
+                                probe->is_paired;
+                            s_discovered_nodes[found_idx].services_count =
+                                probe->services_count;
+                            strncpy(
+                                s_discovered_nodes[found_idx].node_name,
+                                probe->node_name,
+                                sizeof(
+                                    s_discovered_nodes[found_idx].node_name) -
+                                    1);
+                            s_discovered_nodes[found_idx]
+                                .node_name[sizeof(s_discovered_nodes[found_idx]
+                                                      .node_name) -
+                                           1] = '\0';
+                            printf("[SDP] Nodo actualizado en RAM: %s\n",
+                                   s_discovered_nodes[found_idx].node_name);
+                        } else if (s_discovered_count <
+                                   RADIO_MAX_DISCOVERED_NODES) {
+                            memcpy(s_discovered_nodes[s_discovered_count].mac,
+                                   rx_pkt.mac, 6);
+                            strncpy(
+                                s_discovered_nodes[s_discovered_count]
+                                    .node_name,
+                                probe->node_name,
+                                sizeof(s_discovered_nodes[s_discovered_count]
+                                           .node_name) -
+                                    1);
+                            s_discovered_nodes[s_discovered_count].node_name
+                                [sizeof(s_discovered_nodes[s_discovered_count]
+                                            .node_name) -
+                                 1] = '\0';
+                            s_discovered_nodes[s_discovered_count].node_type =
+                                probe->node_type;
+                            s_discovered_nodes[s_discovered_count].is_paired =
+                                probe->is_paired;
+                            s_discovered_nodes[s_discovered_count]
+                                .services_count = probe->services_count;
+                            s_discovered_nodes[s_discovered_count].rssi =
+                                rx_pkt.rssi;
+                            s_discovered_nodes[s_discovered_count]
+                                .last_seen_ms = now_ms;
+                            printf(
+                                "[SDP] Nuevo nodo agregado a RAM: %s (#%zu)\n",
+                                s_discovered_nodes[s_discovered_count]
+                                    .node_name,
+                                s_discovered_count + 1);
+                            s_discovered_count++;
+                        }
+                        xSemaphoreGive(s_discovered_mutex);
+                    }
+
+                    radio_manager_print_nodes_table();
                 }
             }
         }

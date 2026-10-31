@@ -2,7 +2,7 @@
 #define CONFIG_H
 
 #define DISPLAY_SDA 21
-#define DISPLAY_SCL 22
+#define DISPLAY_SCL 22 
 
 #define PIN_BTN_UP 17
 #define PIN_BTN_DOWN 16
